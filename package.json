@@ -1,0 +1,10 @@
+{
+  "name": "vasa-auth",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "echo \"No build\"",
+    "start": "node"
+  }
+}
