@@ -1,37 +1,35 @@
-import type { VercelRequest, VercelResponse } from 'vercel';
+// api/auth/start.ts
+export const config = { runtime: 'edge' };
+
+const CLIENT_ID = 'urn:vasaauktioner:prod';
+const CRIIPTO_AUTH = 'https://vasaauktioner.criipto.id/oauth2/authorize';
+const FINALIZE = 'https://auth.vasaauktioner.se/api/auth/finalize';
 
 function isMobile(ua: string) {
-  // enkel men funkar bra här
-  return /Android|iPhone|iPad|iPod/i.test(ua || '');
+  return /iphone|ipad|ipod|android|mobile/i.test(ua || '');
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const returnUrl =
-    (typeof req.query.return === 'string' && req.query.return) ||
-    'https://vasaauktioner.se/post-login';
+export default async (req: Request) => {
+  const url = new URL(req.url);
+  const returnTo = url.searchParams.get('return') || 'https://vasaauktioner.se/post-login';
 
-  const ua = req.headers['user-agent'] || '';
-  // Mobil => same-device (öppna BankID-appen)
-  // Desktop => QR (lämna bort same-device)
+  // Desktop = QR, Mobil = samma enhet
+  const ua = req.headers.get('user-agent') || '';
   const acr = isMobile(ua)
     ? 'urn:grn:authn:se:bankid:same-device'
-    : 'urn:grn:authn:se:bankid';
+    : 'urn:grn:authn:se:bankid:another-device';
 
-  const params = new URLSearchParams({
-    client_id: 'urn:vasaauktioner:prod',
-    redirect_uri: 'https://auth.vasaauktioner.se/api/auth/finalize',
-    response_type: 'code',
-    scope: 'openid',
-    state: Math.random().toString(36).slice(2),
-    prompt: 'login',
-    acr_values: acr,
-  });
+  const state = crypto.randomUUID(); // enkelt state; vi kan lägga ID-lagring senare
 
-  const authorizeUrl = `https://vasaauktioner.criipto.id/oauth2/authorize?${params.toString()}`;
-  // spara returnUrl i en kortlivad cookie så finalize vet vart vi ska tillbaka
-  res.setHeader(
-    'Set-Cookie',
-    `va_return=${encodeURIComponent(returnUrl)}; Path=/; Max-Age=300; Secure; SameSite=Lax`
-  );
-  res.redirect(authorizeUrl);
-}
+  const authUrl = new URL(CRIIPTO_AUTH);
+  authUrl.searchParams.set('client_id', CLIENT_ID);
+  authUrl.searchParams.set('redirect_uri', FINALIZE);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('scope', 'openid');
+  authUrl.searchParams.set('prompt', 'login');
+  authUrl.searchParams.set('acr_values', acr);
+  authUrl.searchParams.set('ui_locales', 'sv');
+  authUrl.searchParams.set('state', JSON.stringify({ state, returnTo }));
+
+  return Response.redirect(authUrl.toString(), 302);
+};
