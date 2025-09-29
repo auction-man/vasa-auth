@@ -1,0 +1,11 @@
+{
+  "functions": {
+    "api/auth/*.ts": {
+      "runtime": "edge"
+    }
+  },
+  "routes": [
+    { "src": "/api/auth/start", "dest": "/api/auth/start.ts" },
+    { "src": "/api/auth/finalize", "dest": "/api/auth/finalize.ts" }
+  ]
+}
