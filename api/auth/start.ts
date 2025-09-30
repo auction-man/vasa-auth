@@ -1,33 +1,30 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
+// Skickar användaren till Criipto authorize med state={return:url}
+const CRIIPTO_DOMAIN = process.env.CRIIPTO_DOMAIN!;
+const CRIIPTO_CLIENT_ID = process.env.CRIIPTO_CLIENT_ID!;
+const FINALIZE_URL = process.env.FINALIZE_URL!; // ex: https://auth.vasaauktioner.se/api/auth/finalize
 
-const CRIIPTO_DOMAIN = process.env.CRIIPTO_DOMAIN!;           // t.ex. vasaauktioner.criipto.id
-const CRIIPTO_CLIENT_ID = process.env.CRIIPTO_CLIENT_ID!;     // t.ex. urn:vasaauktioner:prod
-const FINALIZE_URL = process.env.FINALIZE_URL!;               // https://auth.vasaauktioner.se/api/auth/finalize
-
-// Hjälp: säkert base64 (utan padding)
-function b64url(input: string) {
-  return Buffer.from(input, 'utf8').toString('base64url');
-}
-
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: any, res: any) {
   try {
-    // Var ska vi tillbaka efter login?
-    const ret = typeof req.query.return === 'string'
-      ? req.query.return
-      : 'https://vasaauktioner.se/post-login';
+    const returnUrl =
+      typeof req.query.return === 'string'
+        ? req.query.return
+        : 'https://vasaauktioner.se/post-login';
 
-    // Lägg return i OIDC state (så finalize kan läsa den)
-    const state = b64url(JSON.stringify({ return: ret }));
+    const state = Buffer.from(JSON.stringify({ return: returnUrl })).toString('base64url');
 
-    const authorizeUrl = new URL(`https://${CRIIPTO_DOMAIN}/oauth2/authorize`);
-    authorizeUrl.searchParams.set('client_id', CRIIPTO_CLIENT_ID);
-    authorizeUrl.searchParams.set('response_type', 'code');
-    authorizeUrl.searchParams.set('scope', 'openid');
-    authorizeUrl.searchParams.set('redirect_uri', FINALIZE_URL);
-    authorizeUrl.searchParams.set('state', state);
+    const authorize = new URL(`https://${CRIIPTO_DOMAIN}/oauth2/authorize`);
+    authorize.searchParams.set('client_id', CRIIPTO_CLIENT_ID);
+    authorize.searchParams.set('redirect_uri', FINALIZE_URL);
+    authorize.searchParams.set('response_type', 'code');
+    authorize.searchParams.set('scope', 'openid email');
+    authorize.searchParams.set('state', state);
 
-    res.status(302).setHeader('Location', authorizeUrl.toString()).end();
+    res.statusCode = 302;
+    res.setHeader('Location', authorize.toString());
+    res.end();
   } catch (e: any) {
-    res.status(500).json({ error: 'start_error', message: e?.message || String(e) });
+    res.statusCode = 500;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ error: 'start_error', message: e?.message || String(e) }));
   }
 }
