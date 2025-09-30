@@ -1,16 +1,14 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 
-// === Env (måste vara satta i Vercel) ===
 const CRIIPTO_DOMAIN = process.env.CRIIPTO_DOMAIN!;
 const CRIIPTO_CLIENT_ID = process.env.CRIIPTO_CLIENT_ID!;
 const CRIIPTO_CLIENT_SECRET = process.env.CRIIPTO_CLIENT_SECRET!;
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE!;
 const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || '.vasaauktioner.se';
-const FINALIZE_URL = process.env.FINALIZE_URL!; // ex: https://auth.vasaauktioner.se/api/auth/finalize
+const FINALIZE_URL = process.env.FINALIZE_URL!; // https://auth.vasaauktioner.se/api/auth/finalize
 
-// === Helpers ===
 function decodePayload(idToken: string): any {
   const parts = idToken.split('.');
   if (parts.length < 2) throw new Error('Invalid id_token');
@@ -23,13 +21,12 @@ function parseState(state?: string): { return?: string } {
   catch { return {}; }
 }
 
-// Sätter både sessionscookie och en sub-cookie som backend kan läsa
 function buildCookies(bankid_subject: string): string[] {
-  const maxAge = 60 * 60 * 24 * 30; // 30 dagar
+  const maxAge = 60 * 60 * 24 * 30;
   const common = [`Path=/`, `Domain=${COOKIE_DOMAIN}`, `Max-Age=${maxAge}`, `SameSite=Lax`, `Secure`];
   return [
     ['va_session=ok', ...common].join('; '),
-    [`va_sub=${encodeURIComponent(bankid_subject)}`, ...common].join('; ')
+    [`va_sub=${encodeURIComponent(bankid_subject)}`, ...common].join('; ') // så /api/profile/complete kan läsa
   ];
 }
 
@@ -39,7 +36,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!code) return res.status(400).json({ error: 'missing_code' });
 
   try {
-    // 1) Hämta tokens via Criipto (OAuth token exchange)
+    // 1) Token exchange mot Criipto
     const params = new URLSearchParams();
     params.set('grant_type', 'authorization_code');
     params.set('code', code);
@@ -58,7 +55,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const tok = await tokenResp.json() as { id_token: string };
 
-    // 2) Dekoda ID token
+    // 2) Läs claims
     const claims = decodePayload(tok.id_token);
     const bankid_subject: string = claims.sub;
     const display_name: string | null =
@@ -69,25 +66,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!bankid_subject) throw new Error('missing_sub_claim');
 
-    // 3) Upsert i public.profiles med service_role
+    // 3) Upsert profil
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } });
-
     const { data: existing, error: selErr } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('bankid_subject', bankid_subject)
-      .maybeSingle();
+      .from('profiles').select('id').eq('bankid_subject', bankid_subject).maybeSingle();
     if (selErr) throw selErr;
 
     let firstTime = false;
-
     if (!existing) {
       const { error: insErr } = await supabase.from('profiles').insert({
         bankid_subject,
         personal_number_hash: personal_number_hash ?? null,
         display_name: display_name ?? null,
-        email: email ?? null,                 // email är nullable i din DB nu
-        needs_contact_info: true,             // triggar onboarding
+        email: email ?? null,
+        needs_contact_info: true,
         last_login_at: new Date().toISOString(),
       });
       if (insErr) throw insErr;
@@ -104,10 +96,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (updErr) throw updErr;
     }
 
-    // 4) Sätt cookies och redirecta
+    // 4) Cookies + redirect VIA /post-login (alltid)
     res.setHeader('Set-Cookie', buildCookies(bankid_subject));
-    const { return: returnUrl } = parseState(stateParam);
-    const target = new URL((returnUrl && typeof returnUrl === 'string') ? returnUrl : 'https://vasaauktioner.se/post-login');
+
+    const { return: originalReturn } = parseState(stateParam); // kan vara vilken sida som helst
+    const target = new URL('https://vasaauktioner.se/post-login');
+    if (originalReturn) target.searchParams.set('return', originalReturn);
     if (firstTime) target.searchParams.set('first', '1');
 
     res.status(302).setHeader('Location', target.toString()).end();
