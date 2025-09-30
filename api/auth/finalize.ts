@@ -1,229 +1,154 @@
-// api/auth/finalize.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import crypto from 'crypto';
+import { createClient } from '@supabase/supabase-js';
 
-const {
-  CRIIPTO_TOKEN_URL,
-  CRIIPTO_CLIENT_ID,
-  CRIIPTO_CLIENT_SECRET,
-  FINALIZE_URL,
+const CRIIPTO_DOMAIN = process.env.CRIIPTO_DOMAIN!;
+const CRIIPTO_CLIENT_ID = process.env.CRIIPTO_CLIENT_ID!;
+const CRIIPTO_CLIENT_SECRET = process.env.CRIIPTO_CLIENT_SECRET!;
+const SUPABASE_URL = process.env.SUPABASE_URL!;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE!;
+const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || '.vasaauktioner.se'; // håll som .vasaauktioner.se
+const FINALIZE_URL = process.env.FINALIZE_URL!; // https://auth.vasaauktioner.se/api/auth/finalize
 
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE,
-
-  COOKIE_DOMAIN = '.vasaauktioner.se',
-  COOKIE_MAX_AGE = '1209600', // 14 dagar
-} = process.env;
-
-function decodeJwtPayload(jwt: string): any {
-  const [, payload] = jwt.split('.');
-  const json = Buffer.from(payload, 'base64').toString('utf8');
+// Vi kör standard Node-runtime (inte edge) → Buffer funkar fint
+function decodeIdTokenPayload(idToken: string): any {
+  const parts = idToken.split('.');
+  if (parts.length < 2) throw new Error('Invalid id_token');
+  const json = Buffer.from(parts[1], 'base64url').toString('utf8');
   return JSON.parse(json);
 }
-const sha256 = (s: string) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 
-function setVaSessionCookie() {
+function parseState(state?: string): { return?: string } {
+  if (!state) return {};
+  try {
+    return JSON.parse(Buffer.from(state, 'base64url').toString('utf8')) || {};
+  } catch {
+    return {};
+  }
+}
+
+function buildCookie(): string {
+  // 30 dagar
+  const maxAge = 60 * 60 * 24 * 30;
+  // Viktigt: ej HttpOnly (frontend behöver läsa cookie), SameSite=Lax är korrekt för login-redirects
   return [
-    [
-      `va_session=ok`,
-      `Domain=${COOKIE_DOMAIN}`,
-      'Path=/',
-      'Secure',
-      'HttpOnly',
-      'SameSite=Lax',
-      `Max-Age=${COOKIE_MAX_AGE}`,
-    ].join('; '),
-  ];
-}
-
-function redirect(res: VercelResponse, to: string, cookies?: string[], log?: any) {
-  if (log) console.log('[finalize] redirect meta:', log);
-  if (cookies?.length) res.setHeader('Set-Cookie', cookies);
-  res.status(302).setHeader('Location', to).end();
-}
-
-function basicAuthHeader(id: string, secret: string) {
-  const b64 = Buffer.from(`${id}:${secret}`).toString('base64');
-  return `Basic ${b64}`;
-}
-
-function ok(v?: string) {
-  return Boolean(v && typeof v === 'string' && v.trim().length > 0);
+    `va_session=ok`,
+    `Path=/`,
+    `Domain=${COOKIE_DOMAIN}`,
+    `Max-Age=${maxAge}`,
+    `SameSite=Lax`,
+    `Secure`,
+  ].join('; ');
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const code = typeof req.query.code === 'string' ? req.query.code : undefined;
+  const stateParam = typeof req.query.state === 'string' ? req.query.state : undefined;
+
+  if (!code) {
+    return res.status(400).json({ error: 'missing_code' });
+  }
+
   try {
-    // --- Health/Debug ---
-    if (req.query.ping) return res.status(200).send('finalize-pong');
+    // 1) Byt code → tokens hos Criipto
+    const tokenUrl = `https://${CRIIPTO_DOMAIN}/oauth2/token`;
+    const body = new URLSearchParams();
+    body.set('grant_type', 'authorization_code');
+    body.set('code', code);
+    body.set('redirect_uri', FINALIZE_URL);
+    // Client auth i body (alternativ: Basic Auth)
+    body.set('client_id', CRIIPTO_CLIENT_ID);
+    body.set('client_secret', CRIIPTO_CLIENT_SECRET);
 
-    if (req.query.dbg) {
-      // läcker inte hemligheter – visar bara "present: true/false"
-      return res.status(200).json({
-        env: {
-          CRIIPTO_TOKEN_URL: ok(CRIIPTO_TOKEN_URL),
-          CRIIPTO_CLIENT_ID: ok(CRIIPTO_CLIENT_ID),
-          CRIIPTO_CLIENT_SECRET: ok(CRIIPTO_CLIENT_SECRET),
-          FINALIZE_URL: ok(FINALIZE_URL),
-          SUPABASE_URL: ok(SUPABASE_URL),
-          SUPABASE_SERVICE_ROLE: ok(SUPABASE_SERVICE_ROLE),
-          COOKIE_DOMAIN,
-        },
-      });
-    }
-
-    // --- Env validation (logga tydligt om något saknas) ---
-    const missing: string[] = [];
-    if (!ok(CRIIPTO_TOKEN_URL)) missing.push('CRIIPTO_TOKEN_URL');
-    if (!ok(CRIIPTO_CLIENT_ID)) missing.push('CRIIPTO_CLIENT_ID');
-    if (!ok(CRIIPTO_CLIENT_SECRET)) missing.push('CRIIPTO_CLIENT_SECRET');
-    if (!ok(FINALIZE_URL)) missing.push('FINALIZE_URL');
-    if (!ok(SUPABASE_URL)) missing.push('SUPABASE_URL');
-    if (!ok(SUPABASE_SERVICE_ROLE)) missing.push('SUPABASE_SERVICE_ROLE');
-
-    if (missing.length) {
-      console.error('[finalize] Missing env vars:', missing);
-      return res.status(500).send('Auth finalize failed (env)');
-    }
-
-    const code = String(req.query.code || '');
-    const state = String(req.query.state || '');
-    const explicitReturn = typeof req.query.return === 'string' ? String(req.query.return) : '';
-
-    if (!code) {
-      console.error('[finalize] missing code');
-      return res.status(400).send('Auth finalize failed (missing code)');
-    }
-
-    const defaultReturn = explicitReturn || 'https://vasaauktioner.se/post-login';
-
-    // --- Token exchange mot Criipto ---
-    const body = new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      client_id: String(CRIIPTO_CLIENT_ID),
-      // client_secret döljs i body OCH vi provar även Basic nedan
-      client_secret: String(CRIIPTO_CLIENT_SECRET),
-      redirect_uri: String(FINALIZE_URL),
-    });
-
-    let tokenResp = await fetch(String(CRIIPTO_TOKEN_URL), {
+    const tokenResp = await fetch(tokenUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
     });
 
     if (!tokenResp.ok) {
-      // Prova igen med Basic-Auth (vissa IdP kräver detta)
-      const body2 = new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: String(FINALIZE_URL),
-      });
-      tokenResp = await fetch(String(CRIIPTO_TOKEN_URL), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: basicAuthHeader(String(CRIIPTO_CLIENT_ID), String(CRIIPTO_CLIENT_SECRET)),
-        },
-        body: body2,
-      });
+      const errTxt = await tokenResp.text().catch(() => '');
+      throw new Error(`token_exchange_failed: ${tokenResp.status} ${errTxt}`);
     }
 
-    if (!tokenResp.ok) {
-      const txt = await tokenResp.text().catch(() => '');
-      console.error('[finalize] token exchange failed', tokenResp.status, txt);
-      return res.status(500).send('Auth finalize failed');
-    }
-
-    const tokenJson = (await tokenResp.json()) as any;
-    const idToken = tokenJson.id_token as string;
-    if (!idToken) {
-      console.error('[finalize] no id_token in response', tokenJson);
-      return res.status(500).send('Auth finalize failed');
-    }
-
-    // --- Claims ---
-    const claims = decodeJwtPayload(idToken);
-    const subject: string | undefined = claims.sub;
-    const possiblePn =
-      claims.personalNumber ||
-      claims.ssn ||
-      claims.pnr ||
-      claims['https://claims.oidc.se/identity_number'] ||
-      claims['https://bankid/ssn'];
-    if (!subject) {
-      console.error('[finalize] missing subject in id_token', claims);
-      return res.status(500).send('Auth finalize failed');
-    }
-    const personalNumberHash = possiblePn ? sha256(String(possiblePn)) : null;
-
-    // --- Supabase: check + create/update profile ---
-    const sbHeaders = {
-      apikey: String(SUPABASE_SERVICE_ROLE),
-      Authorization: `Bearer ${String(SUPABASE_SERVICE_ROLE)}`,
-      'Content-Type': 'application/json',
+    const tok = await tokenResp.json() as {
+      id_token: string;
+      access_token?: string;
+      token_type?: string;
+      expires_in?: number;
     };
 
-    const selectUrl = new URL(`${SUPABASE_URL}/rest/v1/profiles`);
-    selectUrl.searchParams.set('select', 'id,bankid_subject');
-    selectUrl.searchParams.set('bankid_subject', `eq.${subject}`);
+    // 2) Plocka claims ur id_token
+    const claims = decodeIdTokenPayload(tok.id_token);
+    // Minimalt: sub (bankid-subject). Andra claims varierar, men namn/ssn kan finnas.
+    const bankid_subject: string = claims.sub;
+    const display_name: string | null =
+      claims.name || claims['given_name'] || claims['custom:name'] || null;
 
-    const existedResp = await fetch(selectUrl.toString(), { headers: sbHeaders });
-    if (!existedResp.ok) {
-      const txt = await existedResp.text().catch(() => '');
-      console.error('[finalize] supabase select error', existedResp.status, txt);
-      // vi släpper in ändå, men loggar
-    }
-    const existed = existedResp.ok ? ((await existedResp.json()) as any[]) : [];
+    // Vanliga personnummer-claims från BankID via Criipto kan heta t.ex. "identity_number" eller liknande.
+    // Vi använder "hash"-fältet i din DB – lägg det du har eller lämna null.
+    const personal_number_hash: string | null =
+      claims['identity_number'] || claims['cnp'] || claims['pid'] || null;
 
-    let firstLogin = false;
+    if (!bankid_subject) throw new Error('missing_sub_claim');
 
-    if (!Array.isArray(existed) || existed.length === 0) {
-      firstLogin = true;
-      const upsertResp = await fetch(`${SUPABASE_URL}/rest/v1/profiles`, {
-        method: 'POST',
-        headers: { ...sbHeaders, Prefer: 'resolution=merge-duplicates,return=representation' },
-        body: JSON.stringify([
-          {
-            bankid_subject: subject,
-            personal_number_hash: personalNumberHash,
-            display_name: null,
-            phone: null,
-            needs_contact_info: true,
-            last_login_at: new Date().toISOString(),
-          },
-        ]),
+    // 3) Upsert i Supabase (public.profiles)
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+      auth: { persistSession: false },
+    });
+
+    // Finns rad redan?
+    const { data: existing, error: selErr } = await supabase
+      .from('profiles')
+      .select('id, bankid_subject')
+      .eq('bankid_subject', bankid_subject)
+      .maybeSingle();
+
+    if (selErr) throw selErr;
+
+    let firstTime = false;
+
+    if (!existing) {
+      // Insert första gången
+      const { error: insErr } = await supabase.from('profiles').insert({
+        bankid_subject,
+        personal_number_hash: personal_number_hash ?? null,
+        display_name: display_name ?? null,
+        needs_contact_info: true,           // första gången → trigga onboarding
+        last_login_at: new Date().toISOString(),
       });
-      if (!upsertResp.ok) {
-        const txt = await upsertResp.text().catch(() => '');
-        console.error('[finalize] supabase upsert error', upsertResp.status, txt);
-      } else {
-        console.log('[finalize] profile created for', subject);
-      }
+      if (insErr) throw insErr;
+      firstTime = true;
     } else {
-      const updateResp = await fetch(
-        `${SUPABASE_URL}/rest/v1/profiles?bankid_subject=eq.${encodeURIComponent(subject)}`,
-        {
-          method: 'PATCH',
-          headers: { ...sbHeaders, Prefer: 'return=minimal' },
-          body: JSON.stringify({ last_login_at: new Date().toISOString() }),
-        }
-      );
-      if (!updateResp.ok) {
-        const txt = await updateResp.text().catch(() => '');
-        console.warn('[finalize] supabase update warning', updateResp.status, txt);
-      }
+      // Update befintlig
+      const { error: updErr } = await supabase
+        .from('profiles')
+        .update({
+          // Spara ev. ny affärsnyttig metadata men skriv inte över manuellt ifyllt namn om du inte vill
+          display_name: display_name ?? undefined,
+          last_login_at: new Date().toISOString(),
+        })
+        .eq('bankid_subject', bankid_subject);
+      if (updErr) throw updErr;
     }
 
-    // --- Cookie + redirect ---
-    const cookies = setVaSessionCookie();
-    const ret = new URL(defaultReturn);
-    if (firstLogin) ret.searchParams.set('first', '1');
+    // 4) Sätt session-cookie för frontend (läsbar i JS)
+    res.setHeader('Set-Cookie', buildCookie());
 
-    return redirect(res, ret.toString(), cookies, { firstLogin, subject });
+    // 5) Redirecta tillbaka dit vi skulle
+    const { return: returnUrl } = parseState(stateParam);
+    const fallback = 'https://vasaauktioner.se/post-login';
+    const target = new URL((returnUrl && typeof returnUrl === 'string') ? returnUrl : fallback);
 
-  } catch (err: any) {
-    console.error('[finalize] ERROR', err?.message || err);
-    return res.status(500).send('Auth finalize failed');
+    if (firstTime) target.searchParams.set('first', '1');
+
+    // Klart
+    res.status(302).setHeader('Location', target.toString()).end();
+  } catch (e: any) {
+    // Hjälpsam felsöknings-JSON vid problem
+    res.status(500).json({
+      error: 'finalize_error',
+      message: e?.message || String(e),
+      hint: 'Kolla CRIIPTO_* och SUPABASE_* miljövariabler + DB-schema.',
+    });
   }
 }
