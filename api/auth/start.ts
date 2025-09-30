@@ -1,41 +1,33 @@
-export const config = { runtime: "edge" };
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 
+const CRIIPTO_DOMAIN = process.env.CRIIPTO_DOMAIN!;           // t.ex. vasaauktioner.criipto.id
+const CRIIPTO_CLIENT_ID = process.env.CRIIPTO_CLIENT_ID!;     // t.ex. urn:vasaauktioner:prod
+const FINALIZE_URL = process.env.FINALIZE_URL!;               // https://auth.vasaauktioner.se/api/auth/finalize
+
+// Hjälp: säkert base64 (utan padding)
 function b64url(input: string) {
-  return Buffer.from(input).toString("base64url");
+  return Buffer.from(input, 'utf8').toString('base64url');
 }
 
-function allowedReturn(u: string): string | null {
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    const url = new URL(u);
-    // Tillåt bara tillbaka till vasaauktioner.se (apex eller subdomäner)
-    if (url.hostname === "vasaauktioner.se" || url.hostname.endsWith(".vasaauktioner.se")) {
-      return url.toString();
-    }
-    return null;
-  } catch {
-    return null;
+    // Var ska vi tillbaka efter login?
+    const ret = typeof req.query.return === 'string'
+      ? req.query.return
+      : 'https://vasaauktioner.se/post-login';
+
+    // Lägg return i OIDC state (så finalize kan läsa den)
+    const state = b64url(JSON.stringify({ return: ret }));
+
+    const authorizeUrl = new URL(`https://${CRIIPTO_DOMAIN}/oauth2/authorize`);
+    authorizeUrl.searchParams.set('client_id', CRIIPTO_CLIENT_ID);
+    authorizeUrl.searchParams.set('response_type', 'code');
+    authorizeUrl.searchParams.set('scope', 'openid');
+    authorizeUrl.searchParams.set('redirect_uri', FINALIZE_URL);
+    authorizeUrl.searchParams.set('state', state);
+
+    res.status(302).setHeader('Location', authorizeUrl.toString()).end();
+  } catch (e: any) {
+    res.status(500).json({ error: 'start_error', message: e?.message || String(e) });
   }
-}
-
-export default async function handler(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-  const wanted = url.searchParams.get("return") ?? "";
-  const returnUrl =
-    allowedReturn(wanted) ?? "https://vasaauktioner.se/post-login";
-
-  // Packa returnUrl i state så vi kan plocka ut den i /finalize
-  const state = b64url(JSON.stringify({ r: returnUrl, t: Date.now() }));
-
-  // Criipto authorize-URL (enda du ev. behöver justera är domain+client_id)
-  const criipto = new URL("https://vasaauktioner.criipto.id/oauth2/authorize");
-  criipto.searchParams.set("client_id", "urn:vasaauktioner:prod");
-  criipto.searchParams.set("redirect_uri", "https://auth.vasaauktioner.se/api/auth/finalize");
-  criipto.searchParams.set("response_type", "code");
-  criipto.searchParams.set("scope", "openid");
-  criipto.searchParams.set("state", state);
-  criipto.searchParams.set("prompt", "login");
-  // QR på desktop, app på mobil:
-  criipto.searchParams.set("acr_values", "urn:grn:authn:se:bankid:same-device urn:grn:authn:se:bankid");
-
-  return Response.redirect(criipto.toString(), 302);
 }
