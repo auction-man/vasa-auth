@@ -1,13 +1,10 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE!;
-
-// Tillåt endast din frontend-origin
 const ALLOWED_ORIGIN = 'https://vasaauktioner.se';
 
-function setCors(res: VercelResponse) {
+function setCors(res: any) {
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -15,20 +12,15 @@ function setCors(res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: any, res: any) {
   setCors(res);
-
-  // Preflight
-  if (req.method === 'OPTIONS') {
-    return res.status(204).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
 
   try {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'method_not_allowed' });
     }
 
-    // Läs cookies (kräver fetch(..., { credentials: 'include' }))
     const cookie = req.headers.cookie || '';
     const hasSession = /(?:^|;\s*)va_session=ok(?:;|$)/.test(cookie);
     const subMatch = cookie.match(/(?:^|;\s*)va_sub=([^;]+)/);
@@ -61,8 +53,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     return res.status(200).json({ ok: true });
   } catch (e: any) {
-    return res
-      .status(500)
-      .json({ error: 'complete_error', message: e?.message || String(e) });
+    return res.status(500).json({ error: 'complete_error', message: e?.message || String(e) });
   }
 }
